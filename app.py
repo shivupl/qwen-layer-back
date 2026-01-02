@@ -4,6 +4,7 @@ import requests
 import os
 import uuid
 import boto3
+import time
 from botocore.client import Config
 from dotenv import load_dotenv
 
@@ -55,8 +56,49 @@ def presign_upload():
     })
 
 
+@app.post("/api/r2/upload")
+def upload_file():
+    """Upload file to R2 via backend to avoid CORS issues"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    try:
+        # Generate unique key
+        key = f"inputs/{uuid.uuid4()}.png"
+        
+        # Upload to R2
+        s3.upload_fileobj(
+            file,
+            os.environ["R2_BUCKET"],
+            key,
+            ExtraArgs={'ContentType': file.content_type or 'image/png'}
+        )
+        
+        # Generate signed GET URL
+        get_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": os.environ["R2_BUCKET"], "Key": key},
+            ExpiresIn=3600,
+        )
+        
+        return jsonify({
+            "getUrl": get_url,
+            "key": key
+        })
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to upload file',
+            'message': str(e)
+        }), 500
+
+
 @app.route('/api/runpod', methods=['POST'])
 def call_runpod():
+    """Start RunPod job and poll until completion"""
     data = request.get_json() or {}
     
     # endpoint_id = os.getenv('RUNPOD_ENDPOINT_ID')
@@ -72,26 +114,75 @@ def call_runpod():
     if not runpod_api_key:
         return jsonify({'error': 'RunPod API key is required'}), 400
     
-    runpod_url = f'https://api.runpod.ai/v2/{endpoint_id}/run'
-    
-    # request 
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {runpod_api_key}',
     }
-    data = {
-        'input': input_data
-    }
-
+    
+    # Step 1: Start the job
+    runpod_run_url = f'https://api.runpod.ai/v2/{endpoint_id}/run'
+    
     try:
+        # Start the job
         response = requests.post(
-            runpod_url,
+            runpod_run_url,
             headers=headers,
-            json=data,
-            timeout=300  # 5 minute timeout
+            json={'input': input_data},
+            timeout=30
         )
         response.raise_for_status()
-        return jsonify(response.json()), response.status_code
+        job_data = response.json()
+        job_id = job_data.get('id')
+        
+        if not job_id:
+            return jsonify({
+                'error': 'No job ID returned from RunPod',
+                'response': job_data
+            }), 500
+        
+        # Step 2: Poll for completion
+        runpod_status_url = f'https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}'
+        max_wait_time = 300  # 5 minutes max
+        poll_interval = 2  # Check every 2 seconds
+        start_time = time.time()
+        
+        while True:
+            # Check if we've exceeded max wait time
+            if time.time() - start_time > max_wait_time:
+                return jsonify({
+                    'error': 'Job timed out',
+                    'job_id': job_id,
+                    'status': 'TIMEOUT'
+                }), 504
+            
+            # Check job status
+            status_response = requests.get(
+                runpod_status_url,
+                headers=headers,
+                timeout=30
+            )
+            status_response.raise_for_status()
+            status_data = status_response.json()
+            
+            status = status_data.get('status', '').upper()
+            
+            if status == 'COMPLETED':
+                # Job is done, return the result
+                return jsonify(status_data), 200
+            elif status in ['FAILED', 'CANCELLED']:
+                return jsonify({
+                    'error': f'Job {status.lower()}',
+                    'job_id': job_id,
+                    'status': status,
+                    'data': status_data
+                }), 500
+            elif status in ['IN_QUEUE', 'IN_PROGRESS']:
+                # Still processing, wait and check again
+                time.sleep(poll_interval)
+            else:
+                # Unknown status, wait and check again
+                time.sleep(poll_interval)
+                
     except requests.exceptions.RequestException as e:
         return jsonify({
             'error': 'Failed to call RunPod API',
