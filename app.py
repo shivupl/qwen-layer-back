@@ -96,16 +96,49 @@ def upload_file():
         }), 500
 
 
+@app.get("/api/r2/fetch-image")
+def fetch_image():
+    """Fetch image from R2 URL via backend to avoid CORS issues"""
+    image_url = request.args.get('url')
+    
+    if not image_url:
+        return jsonify({'error': 'No URL provided'}), 400
+    
+    try:
+        # Fetch the image from R2
+        response = requests.get(image_url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        # Get content type from response
+        content_type = response.headers.get('Content-Type', 'image/png')
+        
+        # Return the image with proper headers
+        from flask import Response
+        return Response(
+            response.content,
+            mimetype=content_type,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': content_type,
+                'Content-Length': str(len(response.content))
+            }
+        )
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to fetch image',
+            'message': str(e)
+        }), 500
+
+
 @app.route('/api/runpod', methods=['POST'])
 def call_runpod():
     """Start RunPod job and poll until completion"""
     data = request.get_json() or {}
     
-    # endpoint_id = os.getenv('RUNPOD_ENDPOINT_ID')
-    # runpod_api_key = os.getenv('RUNPOD_API_KEY')
-    # endpoint_id ="azgbx61zc364v9"
-    endpoint_id ="7xyf35jciyeib6"
-    runpod_api_key ="REDACTED"
+    # endpoint_id = os.environ['RUNPOD_ENDPOINT_ID']
+    # runpod_api_key = os.environ['RUNPOD_API_KEY']
+    endpoint_id = (os.getenv("RUNPOD_ENDPOINT_ID") or "").strip()
+    runpod_api_key = (os.getenv("RUNPOD_API_KEY") or "").strip()
     input_data = data.get('input', {})
     
     if not endpoint_id:
