@@ -7,6 +7,8 @@ import boto3
 import time
 from botocore.client import Config
 from dotenv import load_dotenv
+from typing import Optional
+from openai import OpenAI
 
 load_dotenv()
 
@@ -23,6 +25,48 @@ s3 = boto3.client(
     region_name="auto",
     config=Config(signature_version="s3v4"),
 )
+
+
+# OpenAI client 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in .env")
+
+CAPTION_SYSTEM_PROMPT = """
+You describe images for downstream image-editing models.
+
+Rules:
+- Describe only what is clearly visible.
+- Do not infer identities, story, or character names.
+- Be concise and factual.
+- Quote text exactly. If unsure, write "Unclear".
+- Provide approximate location for each text element (top-left, top-center, top-right, center-left, center, center-right, bottom-left, bottom-center, bottom-right).
+
+Output format (use exactly this structure):
+
+Scene:
+- <...>
+
+Main subject:
+- <...>
+
+Background:
+- <...>
+
+Objects & details:
+- <...>
+
+Text in image (with location):
+- "<text>" — <location>
+
+Style:
+- <...>
+
+Composition:
+- <...>
+""".strip()
+
+
 
 @app.post("/api/r2/presign-upload")
 def presign_upload():
@@ -221,6 +265,51 @@ def call_runpod():
             'error': 'Failed to call RunPod API',
             'message': str(e)
         }), 500
+
+
+
+# Captioning function 
+def get_caption_for_image(image_url: str) -> Optional[str]:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "system", "content": CAPTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Generate the caption in the exact format."},
+                    {"type": "input_image", "image_url": image_url},
+                ],
+            },
+        ],
+    )
+
+    caption = (resp.output_text or "").strip()
+    return caption or None
+
+
+@app.route("/caption", methods=["POST"])
+def caption():
+    # 1) Parse JSON body safely
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON body. Expected an object with image_url."}), 400
+
+    # 2) Extract and validate image_url
+    image_url = (data.get("image_url") or "").strip()
+    if not image_url:
+        return jsonify({"error": "Missing image_url in JSON body"}), 400
+
+    # 3) Call OpenAI to generate caption
+    try:
+        caption_text = get_caption_for_image(image_url)
+    except Exception as e:
+        return jsonify({"error": "Caption failed", "message": str(e)}), 500
+
+    # 4) Return result
+    return jsonify({"caption": caption_text or ""}), 200
 
 
 

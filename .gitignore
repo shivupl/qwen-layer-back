@@ -1,3 +1,4 @@
 .env
 venv/
 put_test.png
+test.py
